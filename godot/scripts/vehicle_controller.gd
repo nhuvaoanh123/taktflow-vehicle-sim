@@ -26,6 +26,12 @@ var ai_wander_timer := 0.0
 var ai_steer_target := 0.0
 var ai_lane_offset := 0.0
 
+# User input (captured even in vECU mode for forwarding to bridge)
+var user_pedal_pct := 0.0
+var user_steer_deg := 0.0
+var user_brake_pct := 0.0
+var user_estop := false
+
 # Sensor data
 var sensor_data := {}
 var _braking := false
@@ -40,6 +46,9 @@ func _ready() -> void:
 	call_deferred("_setup_lidar")
 
 func _physics_process(delta: float) -> void:
+	# Always capture user input (for forwarding to bridge in vECU mode)
+	_capture_user_input()
+
 	if vecu_mode:
 		# In vECU mode, disable all input until state is RUN
 		if vecu_vehicle_state == "INIT" or vecu_vehicle_state == "SAFE_STOP" or vecu_vehicle_state == "SHUTDOWN":
@@ -60,6 +69,14 @@ func _physics_process(delta: float) -> void:
 
 	if vecu_mode and UdpClient:
 		UdpClient.send_sensor_data(sensor_data, get_meta("car_index", 0))
+
+# ── User Input Capture (always runs, even in vECU mode) ──────
+
+func _capture_user_input() -> void:
+	user_pedal_pct = Input.get_action_strength("accelerate") * 100.0
+	user_brake_pct = Input.get_action_strength("brake") * 100.0
+	user_steer_deg = Input.get_axis("steer_right", "steer_left") * 23.0
+	user_estop = Input.is_action_pressed("estop")
 
 # ── Keyboard ─────────────────────────────────────────────────
 
@@ -218,6 +235,11 @@ func _update_sensor_data() -> void:
 		"lidar_distance_m": lidar_distance_m,
 		"position": {"x": global_position.x, "y": global_position.y, "z": global_position.z},
 		"rotation_y": global_rotation_degrees.y,
+		# User input — forwarded by bridge to CVC SPI
+		"pedal_pct": user_pedal_pct,
+		"steer_input_deg": user_steer_deg,
+		"brake_input_pct": user_brake_pct,
+		"estop_input": user_estop,
 	}
 
 # ── Thermal (fixed: proper cooling when idle) ────────────────
