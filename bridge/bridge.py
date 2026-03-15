@@ -24,6 +24,12 @@ import time
 import sys
 
 try:
+    import paho.mqtt.client as mqtt
+    HAS_MQTT = True
+except ImportError:
+    HAS_MQTT = False
+
+try:
     import can
     HAS_CAN = True
 except ImportError:
@@ -322,13 +328,26 @@ class CarBridge:
             pass
 
     def send_pedal_spi(self) -> None:
-        """Forward pedal position from Godot sensor data to CVC SPI UDP."""
+        """Forward pedal from Godot to CVC via SPI UDP.
+        Uses the exact same mapping as fault_inject/pedal_udp.py:
+          position = pct * 1000 / 100
+          angle = (position * 16383) // 1000
+        Dead zone: position < 67 (angle < 1097) = torque 0.
+        When idle, sends 0xFFFF to clear override (CVC returns to default oscillation)."""
         if not self.sensor_data:
             return
-        # Godot sends pedal as percentage, convert to AS5048A angle (14-bit, 0-16383)
+
         pedal_pct = self.sensor_data.get("pedal_pct", 0.0)
-        angle = int(pedal_pct * 16383 / 100.0)
-        angle = max(0, min(16383, angle))
+
+        if pedal_pct < 1.0:
+            # Clear override — CVC returns to default idle oscillation (dead zone)
+            angle = 0xFFFF
+        else:
+            # Same mapping as fault_inject/pedal_udp.py
+            position = pedal_pct * 1000.0 / 100.0
+            angle = int((position * 16383) // 1000)
+            angle = max(0, min(16383, angle))
+
         try:
             self.spi_sock.sendto(struct.pack("<H", angle), self.spi_pedal_addr)
         except Exception:
