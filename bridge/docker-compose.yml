@@ -1,0 +1,167 @@
+# Docker Compose for 3 cars × 4 vECUs each = 12 containers
+# Each car runs on its own virtual CAN interface (vcan0, vcan1, vcan2)
+#
+# Prerequisites:
+#   - Linux host with vcan kernel module (or WSL2)
+#   - Run: ./setup-vcan.sh to create vcan0, vcan1, vcan2
+#   - Build vECU image: docker build -t taktflow-vecu -f ../../taktflow-embedded/docker/Dockerfile.vecu ../../taktflow-embedded
+#
+# Usage:
+#   docker compose up          # Start all 3 cars (12 containers)
+#   docker compose up car1     # Start only car 1 (4 containers)
+
+x-vecu-base: &vecu-base
+  image: taktflow-vecu
+  network_mode: host
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  restart: unless-stopped
+
+services:
+  # ── CAN Setup ────────────────────────────────────────────
+  can-setup:
+    image: alpine
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    command: >
+      sh -c "
+        ip link add dev vcan0 type vcan 2>/dev/null || true;
+        ip link set up vcan0;
+        ip link add dev vcan1 type vcan 2>/dev/null || true;
+        ip link set up vcan1;
+        ip link add dev vcan2 type vcan 2>/dev/null || true;
+        ip link set up vcan2;
+        echo 'vcan0, vcan1, vcan2 ready';
+        sleep infinity
+      "
+
+  # ── Car 1 (Blue) ─────────────────────────────────────────
+  cvc-1:
+    <<: *vecu-base
+    container_name: cvc-1
+    environment:
+      ECU_NAME: cvc
+      CAN_INTERFACE: vcan0
+      SPI_PEDAL_UDP_PORT: "9100"
+      SIL_TIME_SCALE: "1"
+    command: /app/cvc
+    depends_on: [can-setup]
+    profiles: [car1, all]
+
+  rzc-1:
+    <<: *vecu-base
+    container_name: rzc-1
+    environment:
+      ECU_NAME: rzc
+      CAN_INTERFACE: vcan0
+    command: /app/rzc
+    depends_on: [can-setup]
+    profiles: [car1, all]
+
+  fzc-1:
+    <<: *vecu-base
+    container_name: fzc-1
+    environment:
+      ECU_NAME: fzc
+      CAN_INTERFACE: vcan0
+    command: /app/fzc
+    depends_on: [can-setup]
+    profiles: [car1, all]
+
+  sc-1:
+    <<: *vecu-base
+    container_name: sc-1
+    environment:
+      ECU_NAME: sc
+      CAN_INTERFACE: vcan0
+    command: /app/sc
+    depends_on: [can-setup]
+    profiles: [car1, all]
+
+  # ── Car 2 (Red) ──────────────────────────────────────────
+  cvc-2:
+    <<: *vecu-base
+    container_name: cvc-2
+    environment:
+      ECU_NAME: cvc
+      CAN_INTERFACE: vcan1
+      SPI_PEDAL_UDP_PORT: "9101"
+      SIL_TIME_SCALE: "1"
+    command: /app/cvc
+    depends_on: [can-setup]
+    profiles: [car2, all]
+
+  rzc-2:
+    <<: *vecu-base
+    container_name: rzc-2
+    environment:
+      ECU_NAME: rzc
+      CAN_INTERFACE: vcan1
+    command: /app/rzc
+    depends_on: [can-setup]
+    profiles: [car2, all]
+
+  fzc-2:
+    <<: *vecu-base
+    container_name: fzc-2
+    environment:
+      ECU_NAME: fzc
+      CAN_INTERFACE: vcan1
+    command: /app/fzc
+    depends_on: [can-setup]
+    profiles: [car2, all]
+
+  sc-2:
+    <<: *vecu-base
+    container_name: sc-2
+    environment:
+      ECU_NAME: sc
+      CAN_INTERFACE: vcan1
+    command: /app/sc
+    depends_on: [can-setup]
+    profiles: [car2, all]
+
+  # ── Car 3 (Green) ────────────────────────────────────────
+  cvc-3:
+    <<: *vecu-base
+    container_name: cvc-3
+    environment:
+      ECU_NAME: cvc
+      CAN_INTERFACE: vcan2
+      SPI_PEDAL_UDP_PORT: "9102"
+      SIL_TIME_SCALE: "1"
+    command: /app/cvc
+    depends_on: [can-setup]
+    profiles: [car3, all]
+
+  rzc-3:
+    <<: *vecu-base
+    container_name: rzc-3
+    environment:
+      ECU_NAME: rzc
+      CAN_INTERFACE: vcan2
+    command: /app/rzc
+    depends_on: [can-setup]
+    profiles: [car3, all]
+
+  fzc-3:
+    <<: *vecu-base
+    container_name: fzc-3
+    environment:
+      ECU_NAME: fzc
+      CAN_INTERFACE: vcan2
+    command: /app/fzc
+    depends_on: [can-setup]
+    profiles: [car3, all]
+
+  sc-3:
+    <<: *vecu-base
+    container_name: sc-3
+    environment:
+      ECU_NAME: sc
+      CAN_INTERFACE: vcan2
+    command: /app/sc
+    depends_on: [can-setup]
+    profiles: [car3, all]

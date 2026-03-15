@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""
+Godot ↔ vECU CAN Bridge
+Replaces plant_sim: reads actuator CAN commands from vECUs,
+sends them to Godot via UDP. Receives sensor data from Godot,
+encodes as CAN messages and sends to vECUs.
+
+Supports multiple cars, each on its own vcan interface.
+
+Usage:
+    python bridge.py                          # 1 car on vcan0
+    python bridge.py --cars 3                 # 3 cars on vcan0,vcan1,vcan2
+    python bridge.py --cars 1 --no-can        # standalone mode (no CAN, just UDP echo)
+"""
+
+import argparse
+import json
+import socket
+import struct
+import threading
+import time
+import sys
+
+try:
+    import can
+    HAS_CAN = True
+except ImportError:
+    HAS_CAN = False
+    print("[bridge] python-can not installed — running in standalone mode")
+
+
+# ── CAN Message IDs ──────────────────────────────────────────
+
+# Actuator commands FROM ECUs (bridge reads these)
+CAN_ID_ESTOP           = 0x001
+CAN_ID_SC_STATUS       = 0x013
+CAN_ID_VEHICLE_STATE   = 0x100
+CAN_ID_TORQUE_REQ      = 0x101
+CAN_ID_STEER_CMD       = 0x102
+CAN_ID_BRAKE_CMD       = 0x103
+
+# Heartbeats FROM ECUs
+CAN_ID_CVC_HB          = 0x010
+CAN_ID_FZC_HB          = 0x011
+CAN_ID_RZC_HB          = 0x012
+
+# Sensor feedback TO ECUs (bridge writes these)
+CAN_ID_STEERING_STATUS = 0x200
+CAN_ID_BRAKE_STATUS    = 0x201
+CAN_ID_LIDAR_DISTANCE  = 0x220
+CAN_ID_MOTOR_STATUS    = 0x300
+CAN_ID_MOTOR_CURRENT   = 0x301
+CAN_ID_MOTOR_TEMP      = 0x302
+CAN_ID_BATTERY_STATUS  = 0x303
+CAN_ID_FZC_VSENSORS    = 0x600
+CAN_ID_RZC_VSENSORS    = 0x601
+
+# DataIDs for E2E protection (lower nibble of byte 0)
+DATA_IDS = {
+    CAN_ID_STEERING_STATUS: 0x02,
+    CAN_ID_BRAKE_STATUS:    0x03,
+    CAN_ID_LIDAR_DISTANCE:  0x04,
+    CAN_ID_MOTOR_STATUS:    0x05,
+    CAN_ID_MOTOR_CURRENT:   0x06,
+    CAN_ID_MOTOR_TEMP:      0x07,
+    CAN_ID_BATTERY_STATUS:  0x08,
+}
+
+# Vehicle states
+VS_INIT      = 0
+VS_RUN       = 1
+VS_DEGRADED  = 2
+VS_LIMP      = 3
+VS_SAFE_STOP = 4
+
+VS_NAMES = {VS_INIT: "INIT", VS_RUN: "RUN", VS_DEGRADED: "DEGRADED",
+             VS_LIMP: "LIMP", VS_SAFE_STOP: "SAFE_STOP"}
+
+
+# ── E2E Protection ───────────────────────────────────────────
+
+def crc8_sae_j1850(data: bytes) -> int:
+    """CRC-8 SAE J1850 — polynomial 0x1D, init 0xFF, xor-out 0xFF."""
+    crc = 0xFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x80:
+                crc = ((crc << 1) ^ 0x1D) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+    return crc ^ 0xFF
+
+
+def e2e_pack(can_id: int, payload: bytes, alive_counter: int) -> bytes:
+    """Pack payload with E2E header (byte 0 = DataID|AliveCounter, byte 1 = CRC8)."""
+    data_id = DATA_IDS.get(can_id, 0x00)
+    byte0 = ((alive_counter & 0x0F) << 4) | (data_id & 0x0F)
+    # CRC covers: DataID byte + payload
+    crc_input = bytes([byte0]) + payload
+    crc = crc8_sae_j1850(crc_input)
+    return bytes([byte0, crc]) + payload
+
+
+# ── Car Bridge Instance ──────────────────────────────────────
+
+class CarBridge:
+    """Bridge for one car: one vcan interface ↔ one Godot UDP port pair."""
+
+    def __init__(self, car_index: int, can_interface: str,
+                 godot_sensor_port: int, godot_actuator_port: int,
+                 spi_pedal_port: int, use_can: bool = True):
+        self.car_index = car_index
+        self.can_interface = can_interface
+        self.use_can = use_can and HAS_CAN
+
+        # UDP: receive sensor data FROM Godot
+        self.sensor_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sensor_sock.bind(("0.0.0.0", godot_sensor_port))
+        self.sensor_sock.setblocking(False)
+
+        # UDP: send actuator commands TO Godot
+        self.actuator_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.godot_actuator_addr = ("127.0.0.1", godot_actuator_port)
+
+        # UDP: send pedal override to CVC SPI
+        self.spi_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.spi_pedal_addr = ("127.0.0.1", spi_pedal_port)
+
+        # CAN bus
+        self.can_bus = None
+        if self.use_can:
+            try:
+                self.can_bus = can.Bus(channel=can_interface, interface="socketcan")
+                print(f"[Car {car_index}] CAN connected: {can_interface}")
+            except Exception as e:
+                print(f"[Car {car_index}] CAN failed ({e}) — running without CAN")
+                self.use_can = False
+
+        # Alive counters for E2E
+        self.alive_counters = {}
+
+        # Latest actuator state from ECUs
+        self.actuator_state = {
+            "car_index": car_index,
+            "motor_torque_pct": 0.0,
+            "brake_force_pct": 0.0,
+            "steer_cmd_deg": 0.0,
+            "kill_relay": False,
+            "vehicle_state": "INIT",
+            "estop": False,
+            "ecu_heartbeats": {"CVC": 0, "FZC": 0, "RZC": 0, "SC": 0},
+        }
+
+        # Latest sensor data from Godot
+        self.sensor_data = {}
+
+        # ECU heartbeat tracking
+        self.last_heartbeat = {"CVC": 0, "FZC": 0, "RZC": 0, "SC": 0}
+
+        # Vehicle state (for startup sequence)
+        self.vehicle_state = VS_INIT
+        self.start_time = time.time()
+
+        # TX scheduling
+        self.tx_counters = {}
+
+    def get_alive(self, can_id: int) -> int:
+        """Get and increment alive counter for a CAN ID."""
+        count = self.alive_counters.get(can_id, 0)
+        self.alive_counters[can_id] = (count + 1) & 0x0F
+        return count
+
+    # ── CAN RX (actuator commands from ECUs) ─────────────────
+
+    def poll_can(self) -> None:
+        """Non-blocking read of all available CAN messages."""
+        if not self.can_bus:
+            return
+
+        while True:
+            msg = self.can_bus.recv(timeout=0)
+            if msg is None:
+                break
+            self._handle_can_rx(msg)
+
+    def _handle_can_rx(self, msg: can.Message) -> None:
+        aid = msg.arbitration_id
+        d = msg.data
+        now = time.time()
+
+        if aid == CAN_ID_ESTOP and len(d) >= 4:
+            self.actuator_state["estop"] = bool(d[2])
+
+        elif aid == CAN_ID_SC_STATUS and len(d) >= 4:
+            relay_killed = bool(d[2] & 0x01)
+            self.actuator_state["kill_relay"] = relay_killed
+
+        elif aid == CAN_ID_VEHICLE_STATE and len(d) >= 4:
+            vs = d[2] & 0x0F
+            self.vehicle_state = vs
+            self.actuator_state["vehicle_state"] = VS_NAMES.get(vs, "UNKNOWN")
+
+        elif aid == CAN_ID_TORQUE_REQ and len(d) >= 8:
+            torque_raw = d[2]  # 0-100%
+            direction = d[3] & 0x03  # 0=stop, 1=fwd, 2=rev
+            torque_pct = torque_raw / 100.0
+            if direction == 2:
+                torque_pct = -torque_pct
+            elif direction == 0:
+                torque_pct = 0.0
+            self.actuator_state["motor_torque_pct"] = torque_pct
+
+        elif aid == CAN_ID_STEER_CMD and len(d) >= 6:
+            raw = struct.unpack_from("<h", d, 2)[0]
+            angle_deg = raw * 0.01 - 45.0
+            self.actuator_state["steer_cmd_deg"] = angle_deg
+
+        elif aid == CAN_ID_BRAKE_CMD and len(d) >= 4:
+            brake_pct = d[2] / 100.0
+            self.actuator_state["brake_force_pct"] = brake_pct
+
+        elif aid == CAN_ID_CVC_HB:
+            self.last_heartbeat["CVC"] = now
+        elif aid == CAN_ID_FZC_HB:
+            self.last_heartbeat["FZC"] = now
+        elif aid == CAN_ID_RZC_HB:
+            self.last_heartbeat["RZC"] = now
+        elif aid == CAN_ID_SC_STATUS:
+            self.last_heartbeat["SC"] = now
+
+    # ── CAN TX (sensor feedback to ECUs) ─────────────────────
+
+    def send_sensor_can(self) -> None:
+        """Encode Godot sensor data as CAN messages and send to ECUs."""
+        if not self.can_bus or not self.sensor_data:
+            return
+
+        sd = self.sensor_data
+
+        # Motor Status (0x300)
+        rpm = int(sd.get("motor_rpm", 0))
+        torque_echo = int(abs(sd.get("motor_current_a", 0)) / 25.0 * 100)
+        direction = 1 if sd.get("vehicle_speed_kmh", 0) > 0.5 else 0
+        payload = struct.pack("<BHBBx",
+                              min(torque_echo, 100),
+                              min(rpm, 10000),
+                              direction,
+                              1)  # motor enabled
+        data = e2e_pack(CAN_ID_MOTOR_STATUS, payload, self.get_alive(CAN_ID_MOTOR_STATUS))
+        self._can_send(CAN_ID_MOTOR_STATUS, data)
+
+        # Motor Current (0x301)
+        current_ma = int(sd.get("motor_current_a", 0) * 1000)
+        payload = struct.pack("<Hxxxx", min(current_ma, 30000))
+        data = e2e_pack(CAN_ID_MOTOR_CURRENT, payload, self.get_alive(CAN_ID_MOTOR_CURRENT))
+        self._can_send(CAN_ID_MOTOR_CURRENT, data)
+
+        # Motor Temperature (0x302)
+        temp_raw = int(sd.get("motor_temp_c", 25) * 10)  # 0.1°C scale
+        payload = struct.pack("<HHBx", temp_raw, temp_raw, 0)
+        data = e2e_pack(CAN_ID_MOTOR_TEMP, payload, self.get_alive(CAN_ID_MOTOR_TEMP))
+        self._can_send(CAN_ID_MOTOR_TEMP, data)
+
+        # Battery Status (0x303) — no E2E per DBC
+        voltage_mv = int(sd.get("battery_voltage_v", 12.6) * 1000)
+        bat_status = 2  # normal
+        if voltage_mv < 9000:
+            bat_status = 0  # critical UV
+        elif voltage_mv < 10500:
+            bat_status = 1  # UV warning
+        bat_data = struct.pack("<HBxxx", min(voltage_mv, 20000), bat_status)
+        self._can_send(CAN_ID_BATTERY_STATUS, bat_data)
+
+        # Steering Status (0x200)
+        steer_deg = sd.get("steer_angle_deg", 0.0)
+        steer_raw = int(steer_deg * 100)  # sint16
+        payload = struct.pack("<hhBB", steer_raw, steer_raw, 0, 0)
+        data = e2e_pack(CAN_ID_STEERING_STATUS, payload, self.get_alive(CAN_ID_STEERING_STATUS))
+        self._can_send(CAN_ID_STEERING_STATUS, data)
+
+        # Brake Status (0x201)
+        brake_pct = int(abs(sd.get("steer_angle_deg", 0)) * 0)  # from actuator state
+        if self.actuator_state["brake_force_pct"] > 0:
+            brake_pct = int(self.actuator_state["brake_force_pct"] * 100)
+        payload = struct.pack("<BBHBx", min(brake_pct, 100), min(brake_pct, 100), 0, 0)
+        data = e2e_pack(CAN_ID_BRAKE_STATUS, payload, self.get_alive(CAN_ID_BRAKE_STATUS))
+        self._can_send(CAN_ID_BRAKE_STATUS, data)
+
+        # Lidar Distance (0x220)
+        # TODO: get from Godot raycast
+        distance_cm = 1200  # default clear
+        payload = struct.pack("<HHBB", distance_cm, 100, 3, 0)  # zone=clear
+        data = e2e_pack(CAN_ID_LIDAR_DISTANCE, payload, self.get_alive(CAN_ID_LIDAR_DISTANCE))
+        self._can_send(CAN_ID_LIDAR_DISTANCE, data)
+
+        # FZC Virtual Sensors (0x600) — SIL only, no E2E
+        steer_spi = int((steer_deg + 45.0) / 90.0 * 16383)
+        steer_spi = max(0, min(16383, steer_spi))
+        brake_adc = int(self.actuator_state["brake_force_pct"] * 1000)
+        fzc_data = struct.pack("<HHHxx", steer_spi, min(brake_adc, 1000), 0)
+        self._can_send(CAN_ID_FZC_VSENSORS, fzc_data)
+
+        # RZC Virtual Sensors (0x601) — SIL only, no E2E
+        motor_current_ma = int(sd.get("motor_current_a", 0) * 1000)
+        motor_temp_raw = int(sd.get("motor_temp_c", 25) * 10)
+        battery_mv = int(sd.get("battery_voltage_v", 12.6) * 1000)
+        motor_rpm = int(sd.get("motor_rpm", 0))
+        rzc_data = struct.pack("<HHHH",
+                               min(motor_current_ma, 30000),
+                               min(motor_temp_raw, 2000),
+                               min(battery_mv, 20000),
+                               min(motor_rpm, 10000))
+        self._can_send(CAN_ID_RZC_VSENSORS, rzc_data)
+
+    def _can_send(self, can_id: int, data: bytes) -> None:
+        try:
+            msg = can.Message(arbitration_id=can_id, data=data, is_extended_id=False)
+            self.can_bus.send(msg)
+        except Exception:
+            pass
+
+    # ── UDP ───────────────────────────────────────────────────
+
+    def poll_godot_sensors(self) -> None:
+        """Non-blocking read of sensor data from Godot."""
+        while True:
+            try:
+                data, _ = self.sensor_sock.recvfrom(4096)
+                parsed = json.loads(data.decode("utf-8"))
+                self.sensor_data = parsed
+            except BlockingIOError:
+                break
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+
+    def send_actuator_to_godot(self) -> None:
+        """Send current actuator state to Godot."""
+        # Update heartbeat status
+        now = time.time()
+        for ecu in ["CVC", "FZC", "RZC", "SC"]:
+            age = now - self.last_heartbeat.get(ecu, 0)
+            self.actuator_state["ecu_heartbeats"][ecu] = 1 if age < 1.0 else 0
+
+        payload = json.dumps(self.actuator_state).encode("utf-8")
+        try:
+            self.actuator_sock.sendto(payload, self.godot_actuator_addr)
+        except Exception:
+            pass
+
+    def send_pedal_spi(self) -> None:
+        """Forward pedal position from Godot sensor data to CVC SPI UDP."""
+        if not self.sensor_data:
+            return
+        # Godot sends pedal as percentage, convert to AS5048A angle (14-bit, 0-16383)
+        pedal_pct = self.sensor_data.get("pedal_pct", 0.0)
+        angle = int(pedal_pct * 16383 / 100.0)
+        angle = max(0, min(16383, angle))
+        try:
+            self.spi_sock.sendto(struct.pack("<H", angle), self.spi_pedal_addr)
+        except Exception:
+            pass
+
+    # ── Lifecycle ─────────────────────────────────────────────
+
+    def tick(self) -> None:
+        """One bridge cycle: poll inputs, send outputs."""
+        self.poll_can()
+        self.poll_godot_sensors()
+        self.send_sensor_can()
+        self.send_actuator_to_godot()
+        self.send_pedal_spi()
+
+    def close(self) -> None:
+        self.sensor_sock.close()
+        self.actuator_sock.close()
+        self.spi_sock.close()
+        if self.can_bus:
+            self.can_bus.shutdown()
+
+
+# ── Standalone Echo Mode ─────────────────────────────────────
+
+class StandaloneEcho:
+    """When no CAN is available, echo sensor data back as fake actuator commands.
+    This lets Godot run standalone with keyboard controls + dashboard working."""
+
+    def __init__(self, car_index: int, sensor_port: int, actuator_port: int):
+        self.car_index = car_index
+        self.sensor_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sensor_sock.bind(("0.0.0.0", sensor_port))
+        self.sensor_sock.setblocking(False)
+        self.actuator_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.actuator_addr = ("127.0.0.1", actuator_port)
+        self.start_time = time.time()
+
+    def tick(self) -> None:
+        sensor_data = None
+        while True:
+            try:
+                data, _ = self.sensor_sock.recvfrom(4096)
+                sensor_data = json.loads(data.decode("utf-8"))
+            except BlockingIOError:
+                break
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+
+        # Send minimal actuator response (car is in keyboard mode anyway)
+        state = "RUN" if time.time() - self.start_time > 3.0 else "INIT"
+        response = {
+            "car_index": self.car_index,
+            "motor_torque_pct": 0.0,
+            "brake_force_pct": 0.0,
+            "steer_cmd_deg": 0.0,
+            "kill_relay": False,
+            "vehicle_state": state,
+            "estop": False,
+            "ecu_heartbeats": {"CVC": 1, "FZC": 1, "RZC": 1, "SC": 1},
+        }
+        payload = json.dumps(response).encode("utf-8")
+        try:
+            self.actuator_sock.sendto(payload, self.actuator_addr)
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        self.sensor_sock.close()
+        self.actuator_sock.close()
+
+
+# ── Main ─────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Godot ↔ vECU CAN Bridge")
+    parser.add_argument("--cars", type=int, default=1, help="Number of cars (1-3)")
+    parser.add_argument("--no-can", action="store_true", help="Run without CAN (standalone echo)")
+    parser.add_argument("--rate", type=int, default=100, help="Bridge tick rate in Hz")
+    args = parser.parse_args()
+
+    num_cars = max(1, min(3, args.cars))
+    tick_interval = 1.0 / args.rate
+    use_can = not args.no_can and HAS_CAN
+
+    print(f"[bridge] Starting with {num_cars} car(s), CAN={'enabled' if use_can else 'disabled'}, {args.rate} Hz")
+
+    bridges = []
+    for i in range(num_cars):
+        sensor_port = 5001 + i * 2    # Godot sends sensor data here
+        actuator_port = 5002 + i * 2  # Bridge sends actuator commands here
+        spi_port = 9100 + i           # CVC SPI pedal UDP port
+        can_iface = f"vcan{i}"
+
+        if use_can:
+            bridge = CarBridge(i, can_iface, sensor_port, actuator_port, spi_port, use_can=True)
+        else:
+            bridge = StandaloneEcho(i, sensor_port, actuator_port)
+
+        bridges.append(bridge)
+        print(f"[bridge] Car {i}: sensor←:{sensor_port} actuator→:{actuator_port}"
+              + (f" CAN:{can_iface}" if use_can else " (echo)"))
+
+    print("[bridge] Running. Press Ctrl+C to stop.")
+
+    try:
+        while True:
+            t0 = time.monotonic()
+            for b in bridges:
+                b.tick()
+            elapsed = time.monotonic() - t0
+            sleep_time = tick_interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+    except KeyboardInterrupt:
+        print("\n[bridge] Shutting down...")
+    finally:
+        for b in bridges:
+            b.close()
+
+
+if __name__ == "__main__":
+    main()
