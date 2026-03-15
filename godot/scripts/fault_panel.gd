@@ -2,7 +2,7 @@ extends Control
 ## Fault injection panel — triggers faults via REST API to fault-inject service.
 ## Random mode: 10% chance every 5 seconds. Shows state transitions + DTCs.
 
-const FAULT_API := "http://192.168.0.195:8092"
+const FAULT_API := "http://192.168.0.195:8091"
 
 # All faults from safety analysis, mapped to REST API scenarios
 const FAULTS := {
