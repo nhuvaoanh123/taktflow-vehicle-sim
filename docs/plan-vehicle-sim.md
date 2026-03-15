@@ -2,7 +2,78 @@
 
 **Date**: 2026-03-15
 **Status**: Draft
-**Goal**: GPU-accelerated 3D vehicle simulation driven by real vECU code, covering all FMEA/HARA/SIL scenarios
+**Goal**: GPU-accelerated 3D multi-car vehicle simulation driven by real vECU code, covering all FMEA/HARA/SIL scenarios
+
+---
+
+## 0. Multi-Car Architecture
+
+### 0.1 Fleet: 3 Ego Vehicles, Each with 4 vECUs
+
+| ECU | Role | Why needed |
+|---|---|---|
+| **CVC** | Central Vehicle Controller — pedal → commands | Brain |
+| **RZC** | Rear Zone Controller — motor torque, overcurrent/overtemp | Muscles |
+| **FZC** | Front Zone Controller — steering, braking, distance sensor | Steering + braking + perception |
+| **SC** | Safety Controller — watchdog, kill relay, heartbeat | Safety net |
+
+**Not included** (simulated by Godot instead):
+- BMS → Godot provides a voltage/SOC curve per car
+- BCM → headlights/wipers rendered directly by Godot
+- GW → telemetry shown in dashboard overlay
+
+### 0.2 Resource Budget
+
+| Resource | Per car | 3 cars | Available |
+|---|---|---|---|
+| Docker containers | 4 | **12** | — |
+| RAM | ~1.5 GB | ~4.5 GB | 16 GB |
+| CPU threads | ~3 | ~9 | 16 |
+| GPU | 0 | 0 | RTX 4060 (all for Godot) |
+
+### 0.3 Network Topology
+
+Each car gets its own UDP port pair and isolated CAN bus namespace:
+
+```
+Godot (GPU)
+  ├── Car 1: UDP :5001/:5002 ↔ Bridge ↔ [CVC-1, RZC-1, FZC-1, SC-1]
+  ├── Car 2: UDP :5003/:5004 ↔ Bridge ↔ [CVC-2, RZC-2, FZC-2, SC-2]
+  └── Car 3: UDP :5005/:5006 ↔ Bridge ↔ [CVC-3, RZC-3, FZC-3, SC-3]
+```
+
+### 0.4 Traffic + Collision
+
+- 3 ego cars with full vECU stacks (real ECU code)
+- N additional AI traffic cars (scripted waypoint followers, no Docker)
+- Godot physics handles collision between all cars natively
+- Collision force → accelerometer sensor → vECU impact detection → SC triggers SS-SYSTEM-SHUTDOWN
+
+### 0.5 Multi-Car Test Scenarios
+
+| Scenario | Cars Involved | What's Tested |
+|---|---|---|
+| Lead car brakes hard | Car 1 (lead) + Car 2 (follow) | ABS (SG-004), distance sensor (SG-007), FTTI 50ms |
+| Side cut-in | Car 1 + Car 3 | Emergency steer + brake, compound fault |
+| Rear-end collision | Car 2 rear-ends Car 1 | Impact detection → E-Stop → SS-SYSTEM-SHUTDOWN |
+| Intersection conflict | Car 1 + Car 2 at crossing | Right-of-way, collision avoidance |
+| Convoy (all 3) | Car 1 → Car 2 → Car 3 | Cascading brake reaction, E2E latency through fleet |
+| Multi-car pileup | All 3 + AI traffic | Compound faults, multiple SC triggering simultaneously |
+
+### 0.6 Streaming Architecture
+
+```
+Main PC (optional)           Laptop (RTX 4060)              Cloud
+┌──────────────────┐         ┌───────────────────┐          ┌──────────────┐
+│ 12 Docker vECUs  │──UDP──►│ Godot render      │──NVENC──►│ WebRTC relay │──► Browser
+│ if RAM needed    │◄──UDP──│ + physics (GPU)   │          │              │
+└──────────────────┘         └───────────────────┘          └──────────────┘
+     LAN 192.168.0.x              192.168.0.158          sim.taktflow-systems.com
+```
+
+- NVENC hardware encode: ~1% GPU overhead
+- Viewer can inject faults via web UI (WebRTC data channel)
+- All 3 cars visible simultaneously with camera switching
 
 ---
 
@@ -307,7 +378,7 @@ taktflow-vehicle-sim/
 | Godot Engine | 4.3+ | MIT | Physics + rendering |
 | Python 3.12 | — | PSF | UDP bridge |
 | Docker | — | Apache-2.0 | vECU containers |
-| Existing SIL containers | — | proprietary | Real ECU code |
+| Existing SIL containers | — | proprietary | Real ECU code (CVC, RZC, FZC, SC × 3 cars = 12) |
 
 ---
 
