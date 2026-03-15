@@ -420,7 +420,7 @@ def main():
     for i in range(num_cars):
         sensor_port = 5001 + i * 2    # Godot sends sensor data here
         actuator_port = 5002 + i * 2  # Bridge sends actuator commands here
-        spi_port = 9100 + i           # CVC SPI pedal UDP port
+        spi_port = 9101 + i           # CVC SPI pedal UDP port (9101 for vcan1)
         can_iface = f"vcan{i + args.vcan_start}"
 
         if use_can:
