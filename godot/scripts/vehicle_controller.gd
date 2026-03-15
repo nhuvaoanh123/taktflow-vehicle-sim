@@ -1,71 +1,137 @@
 extends VehicleBody3D
-## Vehicle controller — keyboard or vECU driven.
-## In keyboard mode: WASD / arrows to drive.
-## In vECU mode: receives actuator commands from bridge via UDP.
+## Vehicle controller — keyboard, vECU, or AI driven.
 
 # Physics tuning
-var max_engine_force := 600.0
-var max_brake_force := 80.0
-var max_steer_angle := 0.45  # radians (~26 degrees)
+var max_engine_force := 2500.0
+var max_brake_force := 120.0
+var max_steer_angle := 0.4
+var max_reverse_force := 800.0
 
-# vECU bridge state
+# Control mode
 var vecu_mode := false
-var vecu_torque_pct := 0.0       # -1.0 to 1.0
-var vecu_brake_pct := 0.0        # 0.0 to 1.0
-var vecu_steer_deg := 0.0        # degrees
+var ai_mode := false
+
+# vECU state
+var vecu_torque_pct := 0.0
+var vecu_brake_pct := 0.0
+var vecu_steer_deg := 0.0
 var vecu_kill_relay := false
-var vecu_vehicle_state := "INIT"  # INIT, RUN, DEGRADED, SAFE_STOP, SHUTDOWN
+var vecu_vehicle_state := "INIT"
 
-# Sensor data (computed from physics each frame)
+# AI state
+var ai_speed_target := 60.0  # km/h
+var ai_wander_timer := 0.0
+var ai_steer_target := 0.0
+var ai_lane_offset := 0.0
+
+# Sensor data
 var sensor_data := {}
-
-# Brake light state
 var _braking := false
-
-# Thermal model (simple)
 var motor_temp_c := 25.0
 var motor_current_a := 0.0
+var lidar_distance_m := 12.0
 
 func _ready() -> void:
-	# Connect to UDP bridge if autoloaded
 	if UdpClient:
 		UdpClient.actuator_data_received.connect(_on_actuator_data)
 
 func _physics_process(delta: float) -> void:
 	if vecu_mode:
 		_apply_vecu_commands(delta)
+	elif ai_mode:
+		_apply_ai(delta)
 	else:
 		_apply_keyboard_input()
 
+	_update_lidar()
 	_update_sensor_data()
 	_update_thermal_model(delta)
 	_update_brake_lights()
 
-	# Send sensor data to bridge at physics rate
 	if vecu_mode and UdpClient:
-		var car_idx: int = get_meta("car_index", 0)
-		UdpClient.send_sensor_data(sensor_data, car_idx)
+		UdpClient.send_sensor_data(sensor_data, get_meta("car_index", 0))
 
-# ── Keyboard Control ─────────────────────────────────────────
+# ── Keyboard ─────────────────────────────────────────────────
 
 func _apply_keyboard_input() -> void:
 	var throttle := Input.get_action_strength("accelerate")
 	var brake_input := Input.get_action_strength("brake")
 	var steer_input := Input.get_axis("steer_right", "steer_left")
-	var estop := Input.is_action_pressed("estop")
 
-	if estop:
+	if Input.is_action_pressed("estop"):
 		engine_force = 0.0
 		brake = max_brake_force
 		_braking = true
 		return
 
-	engine_force = throttle * max_engine_force
-	brake = brake_input * max_brake_force
-	steering = steer_input * max_steer_angle
-	_braking = brake_input > 0.1
+	var speed_forward := linear_velocity.dot(global_transform.basis.z)
 
-# ── vECU Control ─────────────────────────────────────────────
+	if brake_input > 0.1 and speed_forward > -1.0:
+		engine_force = -brake_input * max_reverse_force
+		brake = 0.0
+		_braking = false
+	elif brake_input > 0.1:
+		engine_force = 0.0
+		brake = brake_input * max_brake_force
+		_braking = true
+	elif throttle > 0.1:
+		engine_force = throttle * max_engine_force
+		brake = 0.0
+		_braking = false
+	else:
+		engine_force = 0.0
+		brake = 0.0
+		_braking = false
+
+	steering = steer_input * max_steer_angle
+
+# ── AI ───────────────────────────────────────────────────────
+
+func _apply_ai(delta: float) -> void:
+	var speed_kmh := linear_velocity.length() * 3.6
+
+	# Wander: gently change lane / steer
+	ai_wander_timer -= delta
+	if ai_wander_timer <= 0:
+		ai_wander_timer = randf_range(2.0, 6.0)
+		ai_lane_offset = randf_range(-4.0, 4.0)
+		ai_speed_target = randf_range(40.0, 90.0)
+
+	# Steer toward lane offset
+	var pos_x := global_position.x
+	var steer_error := (ai_lane_offset - pos_x) * 0.05
+	ai_steer_target = clampf(steer_error, -0.3, 0.3)
+	steering = lerpf(steering, ai_steer_target, 3.0 * delta)
+
+	# Lidar braking
+	if lidar_distance_m < 4.0:
+		engine_force = 0.0
+		brake = max_brake_force * 0.8
+		_braking = true
+		return
+	elif lidar_distance_m < 8.0:
+		ai_speed_target = minf(ai_speed_target, 30.0)
+
+	# Speed control
+	if speed_kmh < ai_speed_target - 5:
+		engine_force = max_engine_force * 0.6
+		brake = 0.0
+		_braking = false
+	elif speed_kmh > ai_speed_target + 5:
+		engine_force = 0.0
+		brake = max_brake_force * 0.3
+		_braking = true
+	else:
+		engine_force = max_engine_force * 0.2
+		brake = 0.0
+		_braking = false
+
+	# Keep on road — steer back if too far
+	if absf(pos_x) > 10.0:
+		var correction := -sign(pos_x) * 0.3
+		steering = lerpf(steering, correction, 5.0 * delta)
+
+# ── vECU ─────────────────────────────────────────────────────
 
 func _apply_vecu_commands(_delta: float) -> void:
 	if vecu_kill_relay or vecu_vehicle_state == "SHUTDOWN":
@@ -74,48 +140,46 @@ func _apply_vecu_commands(_delta: float) -> void:
 		steering = 0.0
 		_braking = true
 		return
-
 	if vecu_vehicle_state == "SAFE_STOP":
 		engine_force = 0.0
 		brake = max_brake_force * 0.7
-		# Keep current steering
 		_braking = true
 		return
 
 	engine_force = vecu_torque_pct * max_engine_force
 	brake = vecu_brake_pct * max_brake_force
-	steering = deg_to_rad(clampf(vecu_steer_deg, -26.0, 26.0))
+	steering = deg_to_rad(clampf(vecu_steer_deg, -23.0, 23.0))
 	_braking = vecu_brake_pct > 0.1
 
 func _on_actuator_data(data: Dictionary) -> void:
-	var car_idx: int = get_meta("car_index", 0)
-	var target_idx: int = data.get("car_index", 0)
-	if target_idx != car_idx:
+	if data.get("car_index", 0) != get_meta("car_index", 0):
 		return
-
 	vecu_torque_pct = data.get("motor_torque_pct", 0.0)
 	vecu_brake_pct = data.get("brake_force_pct", 0.0)
 	vecu_steer_deg = data.get("steer_cmd_deg", 0.0)
 	vecu_kill_relay = data.get("kill_relay", false)
 	vecu_vehicle_state = data.get("vehicle_state", "RUN")
 
-# ── Sensor Data ──────────────────────────────────────────────
+# ── Lidar ────────────────────────────────────────────────────
+
+func _update_lidar() -> void:
+	var ray := get_node_or_null("LidarRay") as RayCast3D
+	if ray and ray.is_colliding():
+		lidar_distance_m = global_position.distance_to(ray.get_collision_point())
+	else:
+		lidar_distance_m = 12.0
+
+# ── Sensors ──────────────────────────────────────────────────
 
 func _update_sensor_data() -> void:
-	var speed_ms := linear_velocity.length()
-	var speed_kmh := speed_ms * 3.6
+	var speed_kmh := linear_velocity.length() * 3.6
+	motor_current_a = absf(engine_force) / max_engine_force * 25.0
 
-	# Wheel RPMs
 	var wheel_rpms := []
+	var motor_rpm := 0.0
 	for child in get_children():
 		if child is VehicleWheel3D:
 			wheel_rpms.append(child.get_rpm())
-
-	# Motor current proportional to applied force
-	motor_current_a = absf(engine_force) / max_engine_force * 25.0
-
-	# Motor RPM from rear wheel average
-	var motor_rpm := 0.0
 	if wheel_rpms.size() >= 4:
 		motor_rpm = absf(wheel_rpms[2] + wheel_rpms[3]) / 2.0
 
@@ -127,20 +191,21 @@ func _update_sensor_data() -> void:
 		"motor_rpm": motor_rpm,
 		"motor_current_a": motor_current_a,
 		"motor_temp_c": motor_temp_c,
-		"battery_voltage_v": 12.6,
+		"battery_voltage_v": 12.6 - motor_current_a * 0.02,
 		"steer_angle_deg": rad_to_deg(steering),
 		"brake_active": _braking,
+		"lidar_distance_m": lidar_distance_m,
 		"position": {"x": global_position.x, "y": global_position.y, "z": global_position.z},
 		"rotation_y": global_rotation_degrees.y,
 	}
 
-# ── Thermal Model ────────────────────────────────────────────
+# ── Thermal (fixed: proper cooling when idle) ────────────────
 
 func _update_thermal_model(delta: float) -> void:
 	var ambient := 25.0
-	var heat_input := motor_current_a * motor_current_a * 0.01  # I²R heating
-	var cooling := (motor_temp_c - ambient) * 0.05  # passive cooling
-	motor_temp_c += (heat_input - cooling) * delta
+	var heat := motor_current_a * motor_current_a * 0.005
+	var cool := (motor_temp_c - ambient) * 0.15
+	motor_temp_c += (heat - cool) * delta
 	motor_temp_c = clampf(motor_temp_c, ambient, 150.0)
 
 # ── Brake Lights ─────────────────────────────────────────────
@@ -148,7 +213,7 @@ func _update_thermal_model(delta: float) -> void:
 func _update_brake_lights() -> void:
 	for child in get_children():
 		if child is MeshInstance3D and child.name.begins_with("BrakeLight"):
-			var mat := child.mesh.material as StandardMaterial3D
+			var mat: StandardMaterial3D = child.mesh.material
 			if mat:
 				if _braking:
 					mat.albedo_color = Color(1, 0, 0)
@@ -156,5 +221,5 @@ func _update_brake_lights() -> void:
 					mat.emission = Color(1, 0, 0)
 					mat.emission_energy_multiplier = 3.0
 				else:
-					mat.albedo_color = Color(0.5, 0, 0)
+					mat.albedo_color = Color(0.4, 0, 0)
 					mat.emission_enabled = false
