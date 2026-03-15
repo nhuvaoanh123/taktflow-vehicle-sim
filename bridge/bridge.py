@@ -15,8 +15,10 @@ Usage:
 
 import argparse
 import json
+import os
 import socket
 import struct
+import subprocess
 import threading
 import time
 import sys
@@ -158,6 +160,9 @@ class CarBridge:
         # ECU heartbeat tracking
         self.last_heartbeat = {"CVC": 0, "FZC": 0, "RZC": 0, "SC": 0}
 
+        # DTC tracking (root cause for SAFE_STOP)
+        self.active_dtcs = []
+
         # Vehicle state (for startup sequence)
         self.vehicle_state = VS_INIT
         self.start_time = time.time()
@@ -228,6 +233,14 @@ class CarBridge:
             self.last_heartbeat["RZC"] = now
         elif aid == CAN_ID_SC_STATUS:
             self.last_heartbeat["SC"] = now
+
+        # DTC broadcast (0x500)
+        elif aid == 0x500 and len(d) >= 4:
+            dtc_code = struct.unpack_from("<H", d, 2)[0]
+            dtc_hex = f"0x{dtc_code:04X}"
+            if dtc_hex not in self.active_dtcs:
+                self.active_dtcs.append(dtc_hex)
+                print(f"[Car {self.car_index}] DTC: {dtc_hex}")
 
     # ── CAN TX (sensor feedback to ECUs) ─────────────────────
 
@@ -336,11 +349,19 @@ class CarBridge:
 
     def send_actuator_to_godot(self) -> None:
         """Send current actuator state to Godot."""
-        # Update heartbeat status
+        # Update heartbeat status and build root cause
         now = time.time()
+        root_causes = list(self.active_dtcs)  # copy DTCs
+
         for ecu in ["CVC", "FZC", "RZC", "SC"]:
             age = now - self.last_heartbeat.get(ecu, 0)
-            self.actuator_state["ecu_heartbeats"][ecu] = 1 if age < 1.0 else 0
+            alive = age < 1.0 if self.last_heartbeat[ecu] > 0 else False
+            self.actuator_state["ecu_heartbeats"][ecu] = 1 if alive else 0
+            if not alive and self.last_heartbeat[ecu] > 0:
+                root_causes.append(f"{ecu}_HEARTBEAT_LOST")
+
+        self.actuator_state["active_dtcs"] = self.active_dtcs
+        self.actuator_state["root_cause"] = root_causes
 
         payload = json.dumps(self.actuator_state).encode("utf-8")
         try:
@@ -459,13 +480,50 @@ def main():
         print(f"[bridge] Car {i}: sensor←:{sensor_port} actuator→:{actuator_port}"
               + (f" CAN:{can_iface}" if use_can else " (echo)"))
 
+    # Command socket — listens for reset/control commands from Godot on port 5099
+    cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cmd_sock.bind(("0.0.0.0", 5099))
+    cmd_sock.setblocking(False)
+    compose_file = os.path.expanduser("~/godot-vecu-compose.yml")
+
+    def poll_commands():
+        """Check for commands from Godot (reset_ecu, etc.)."""
+        while True:
+            try:
+                data, addr = cmd_sock.recvfrom(4096)
+                cmd = json.loads(data.decode("utf-8"))
+                action = cmd.get("cmd", "")
+                if action == "reset_ecu":
+                    print("[bridge] ECU RESET requested from Godot")
+                    # Restart Docker containers in background
+                    threading.Thread(target=_restart_docker, daemon=True).start()
+                    # Send acknowledgement back
+                    ack = json.dumps({"status": "resetting"}).encode("utf-8")
+                    cmd_sock.sendto(ack, addr)
+            except BlockingIOError:
+                break
+            except Exception:
+                continue
+
+    def _restart_docker():
+        try:
+            subprocess.run(
+                ["docker", "compose", "-f", compose_file, "restart"],
+                timeout=30, capture_output=True
+            )
+            print("[bridge] Docker containers restarted")
+        except Exception as e:
+            print(f"[bridge] Docker restart failed: {e}")
+
     print("[bridge] Running. Press Ctrl+C to stop.")
+    print(f"[bridge] Command port: 5099 (send {{\"cmd\":\"reset_ecu\"}})")
 
     try:
         while True:
             t0 = time.monotonic()
             for b in bridges:
                 b.tick()
+            poll_commands()
             elapsed = time.monotonic() - t0
             sleep_time = tick_interval - elapsed
             if sleep_time > 0:
@@ -475,6 +533,7 @@ def main():
     finally:
         for b in bridges:
             b.close()
+        cmd_sock.close()
 
 
 if __name__ == "__main__":

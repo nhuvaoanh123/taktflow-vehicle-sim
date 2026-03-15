@@ -17,6 +17,8 @@ var vecu_brake_pct := 0.0
 var vecu_steer_deg := 0.0
 var vecu_kill_relay := false
 var vecu_vehicle_state := "INIT"
+var vecu_root_cause := ""
+var vecu_active_dtcs: Array = []
 
 # AI state
 var ai_speed_target := 60.0  # km/h
@@ -34,10 +36,18 @@ var lidar_distance_m := 12.0
 func _ready() -> void:
 	if UdpClient:
 		UdpClient.actuator_data_received.connect(_on_actuator_data)
+	# Exclude own body from lidar raycast
+	call_deferred("_setup_lidar")
 
 func _physics_process(delta: float) -> void:
 	if vecu_mode:
-		_apply_vecu_commands(delta)
+		# In vECU mode, disable all input until state is RUN
+		if vecu_vehicle_state == "INIT" or vecu_vehicle_state == "SAFE_STOP" or vecu_vehicle_state == "SHUTDOWN":
+			engine_force = 0.0
+			brake = max_brake_force * 0.5
+			_braking = true
+		else:
+			_apply_vecu_commands(delta)
 	elif ai_mode:
 		_apply_ai(delta)
 	else:
@@ -128,7 +138,7 @@ func _apply_ai(delta: float) -> void:
 
 	# Keep on road — steer back if too far
 	if absf(pos_x) > 10.0:
-		var correction := -sign(pos_x) * 0.3
+		var correction: float = -sign(pos_x) * 0.3
 		steering = lerpf(steering, correction, 5.0 * delta)
 
 # ── vECU ─────────────────────────────────────────────────────
@@ -159,13 +169,24 @@ func _on_actuator_data(data: Dictionary) -> void:
 	vecu_steer_deg = data.get("steer_cmd_deg", 0.0)
 	vecu_kill_relay = data.get("kill_relay", false)
 	vecu_vehicle_state = data.get("vehicle_state", "RUN")
+	var causes: Array = data.get("root_cause", [])
+	vecu_root_cause = ", ".join(PackedStringArray(causes)) if causes.size() > 0 else ""
+	vecu_active_dtcs = data.get("active_dtcs", [])
 
 # ── Lidar ────────────────────────────────────────────────────
 
+func _setup_lidar() -> void:
+	var ray := get_node_or_null("LidarRay") as RayCast3D
+	if ray:
+		ray.add_exception(self)
+
 func _update_lidar() -> void:
 	var ray := get_node_or_null("LidarRay") as RayCast3D
-	if ray and ray.is_colliding():
-		lidar_distance_m = global_position.distance_to(ray.get_collision_point())
+	if not ray:
+		return
+	ray.force_raycast_update()
+	if ray.is_colliding():
+		lidar_distance_m = ray.global_position.distance_to(ray.get_collision_point())
 	else:
 		lidar_distance_m = 12.0
 

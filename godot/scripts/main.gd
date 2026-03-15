@@ -431,6 +431,12 @@ func _input(event: InputEvent) -> void:
 	if event.is_action_pressed("toggle_vecu"):
 		# Only toggle vECU on player car (index 0)
 		cars[0].vecu_mode = !cars[0].vecu_mode
+		if cars[0].vecu_mode:
+			# Reset vECU state so it doesn't start in SAFE_STOP
+			cars[0].vecu_vehicle_state = "INIT"
+			cars[0].vecu_kill_relay = false
+			cars[0].vecu_torque_pct = 0.0
+			cars[0].vecu_brake_pct = 0.0
 
 	# R = reset all cars to starting positions
 	if event is InputEventKey and event.pressed and event.keycode == KEY_R:

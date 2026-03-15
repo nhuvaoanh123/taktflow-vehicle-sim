@@ -65,6 +65,13 @@ func _build() -> void:
 	_labels["car"] = _val_label(tl, 8, 28, 12, "Car 1 — Blue")
 	_labels["car"].add_theme_color_override("font_color", C_DIM)
 
+	# Root cause panel (only visible during SAFE_STOP)
+	var rc := _panel(8, 65, 300, 40, "top_left")
+	_labels["root_cause"] = _val_label(rc, 8, 4, 11, "")
+	_labels["root_cause"].add_theme_color_override("font_color", C_FAULT)
+	_labels["root_cause_title"] = _dim_label(rc, 8, 22, 9, "")
+	rc.name = "RootCausePanel"
+
 	# ── TOP RIGHT: ECU + Reset Button ──
 	var tr := _panel(-150, 8, 142, 140, "top_right")
 	_dim_label(tr, 8, 4, 10, "ECU STATUS")
@@ -157,9 +164,18 @@ func _dim_label(parent: Control, x: int, y: int, sz: int, txt: String) -> Label:
 # ── Reset ECU ──
 
 func _on_reset_pressed() -> void:
-	# Restart vECU containers via bridge or direct signal
-	print("[HUD] ECU Reset requested")
-	# Reset local vECU state on all cars
+	print("[HUD] ECU Reset — sending to bridge")
+	_reset_btn.text = "RESETTING..."
+	_reset_btn.disabled = true
+
+	# Send reset command to bridge on Pi via UDP port 5099
+	var sock := PacketPeerUDP.new()
+	sock.set_dest_address("192.168.0.195", 5099)
+	var cmd := JSON.stringify({"cmd": "reset_ecu"})
+	sock.put_packet(cmd.to_utf8_buffer())
+	sock.close()
+
+	# Reset local state
 	var main := get_tree().root.get_node_or_null("Main")
 	if main:
 		for car in main.get("cars"):
@@ -168,10 +184,12 @@ func _on_reset_pressed() -> void:
 			car.set("vecu_torque_pct", 0.0)
 			car.set("vecu_brake_pct", 0.0)
 
-func _input(event: InputEvent) -> void:
-	# R key = reset ECU
-	if event is InputEventKey and event.pressed and event.keycode == KEY_R:
-		_on_reset_pressed()
+	# Re-enable button after delay
+	get_tree().create_timer(5.0).timeout.connect(_on_reset_done)
+
+func _on_reset_done() -> void:
+	_reset_btn.text = "RESET ECU"
+	_reset_btn.disabled = false
 
 # ── Update ──
 
@@ -249,3 +267,21 @@ func _update() -> void:
 
 	var names := ["Blue", "Red", "Green"]
 	_labels["car"].text = "Car %d — %s" % [idx + 1, names[idx % names.size()]]
+
+	# Root cause (visible only when not in RUN/KEYBOARD)
+	var rc_panel := get_node_or_null("RootCausePanel")
+	if state_str == "SAFE_STOP" or state_str == "SHUTDOWN":
+		var cause: String = car.get("vecu_root_cause")
+		if cause.length() > 0:
+			_labels["root_cause"].text = cause
+			_labels["root_cause_title"].text = "ROOT CAUSE:"
+		else:
+			_labels["root_cause"].text = "Unknown — check ECU logs"
+			_labels["root_cause_title"].text = "ROOT CAUSE:"
+		if rc_panel:
+			rc_panel.visible = true
+	else:
+		_labels["root_cause"].text = ""
+		_labels["root_cause_title"].text = ""
+		if rc_panel:
+			rc_panel.visible = false
