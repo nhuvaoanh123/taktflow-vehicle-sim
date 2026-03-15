@@ -245,76 +245,27 @@ class CarBridge:
     # ── CAN TX (sensor feedback to ECUs) ─────────────────────
 
     def send_sensor_can(self) -> None:
-        """Encode Godot sensor data as CAN messages and send to ECUs."""
-        if not self.can_bus or not self.sensor_data:
+        """Send virtual sensor data to ECUs (replaces plant_sim).
+        Only sends 0x600 (FZC sensors) and 0x601 (RZC sensors).
+        ECUs generate their own status messages (0x200, 0x300, etc.)."""
+        if not self.can_bus:
             return
 
-        sd = self.sensor_data
+        sd = self.sensor_data if self.sensor_data else {
+            "motor_rpm": 0, "motor_current_a": 0, "motor_temp_c": 25,
+            "battery_voltage_v": 12.6, "vehicle_speed_kmh": 0,
+            "steer_angle_deg": 0, "lidar_distance_m": 12.0,
+        }
 
-        # Motor Status (0x300)
-        rpm = int(sd.get("motor_rpm", 0))
-        torque_echo = int(abs(sd.get("motor_current_a", 0)) / 25.0 * 100)
-        direction = 1 if sd.get("vehicle_speed_kmh", 0) > 0.5 else 0
-        payload = struct.pack("<BHBBx",
-                              min(torque_echo, 100),
-                              min(rpm, 10000),
-                              direction,
-                              1)  # motor enabled
-        data = e2e_pack(CAN_ID_MOTOR_STATUS, payload, self.get_alive(CAN_ID_MOTOR_STATUS))
-        self._can_send(CAN_ID_MOTOR_STATUS, data)
-
-        # Motor Current (0x301)
-        current_ma = int(sd.get("motor_current_a", 0) * 1000)
-        payload = struct.pack("<Hxxxx", min(current_ma, 30000))
-        data = e2e_pack(CAN_ID_MOTOR_CURRENT, payload, self.get_alive(CAN_ID_MOTOR_CURRENT))
-        self._can_send(CAN_ID_MOTOR_CURRENT, data)
-
-        # Motor Temperature (0x302)
-        temp_raw = int(sd.get("motor_temp_c", 25) * 10)  # 0.1°C scale
-        payload = struct.pack("<HHBx", temp_raw, temp_raw, 0)
-        data = e2e_pack(CAN_ID_MOTOR_TEMP, payload, self.get_alive(CAN_ID_MOTOR_TEMP))
-        self._can_send(CAN_ID_MOTOR_TEMP, data)
-
-        # Battery Status (0x303) — no E2E per DBC
-        voltage_mv = int(sd.get("battery_voltage_v", 12.6) * 1000)
-        bat_status = 2  # normal
-        if voltage_mv < 9000:
-            bat_status = 0  # critical UV
-        elif voltage_mv < 10500:
-            bat_status = 1  # UV warning
-        bat_data = struct.pack("<HBxxx", min(voltage_mv, 20000), bat_status)
-        self._can_send(CAN_ID_BATTERY_STATUS, bat_data)
-
-        # Steering Status (0x200)
+        # FZC Virtual Sensors (0x600) — steering angle + brake position
         steer_deg = sd.get("steer_angle_deg", 0.0)
-        steer_raw = int(steer_deg * 100)  # sint16
-        payload = struct.pack("<hhBB", steer_raw, steer_raw, 0, 0)
-        data = e2e_pack(CAN_ID_STEERING_STATUS, payload, self.get_alive(CAN_ID_STEERING_STATUS))
-        self._can_send(CAN_ID_STEERING_STATUS, data)
-
-        # Brake Status (0x201)
-        brake_pct = int(abs(sd.get("steer_angle_deg", 0)) * 0)  # from actuator state
-        if self.actuator_state["brake_force_pct"] > 0:
-            brake_pct = int(self.actuator_state["brake_force_pct"] * 100)
-        payload = struct.pack("<BBHBx", min(brake_pct, 100), min(brake_pct, 100), 0, 0)
-        data = e2e_pack(CAN_ID_BRAKE_STATUS, payload, self.get_alive(CAN_ID_BRAKE_STATUS))
-        self._can_send(CAN_ID_BRAKE_STATUS, data)
-
-        # Lidar Distance (0x220)
-        # TODO: get from Godot raycast
-        distance_cm = 1200  # default clear
-        payload = struct.pack("<HHBB", distance_cm, 100, 3, 0)  # zone=clear
-        data = e2e_pack(CAN_ID_LIDAR_DISTANCE, payload, self.get_alive(CAN_ID_LIDAR_DISTANCE))
-        self._can_send(CAN_ID_LIDAR_DISTANCE, data)
-
-        # FZC Virtual Sensors (0x600) — SIL only, no E2E
         steer_spi = int((steer_deg + 45.0) / 90.0 * 16383)
         steer_spi = max(0, min(16383, steer_spi))
         brake_adc = int(self.actuator_state["brake_force_pct"] * 1000)
         fzc_data = struct.pack("<HHHxx", steer_spi, min(brake_adc, 1000), 0)
         self._can_send(CAN_ID_FZC_VSENSORS, fzc_data)
 
-        # RZC Virtual Sensors (0x601) — SIL only, no E2E
+        # RZC Virtual Sensors (0x601) — motor current, temp, battery, rpm
         motor_current_ma = int(sd.get("motor_current_a", 0) * 1000)
         motor_temp_raw = int(sd.get("motor_temp_c", 25) * 10)
         battery_mv = int(sd.get("battery_voltage_v", 12.6) * 1000)
@@ -456,6 +407,7 @@ def main():
     parser.add_argument("--cars", type=int, default=1, help="Number of cars (1-3)")
     parser.add_argument("--no-can", action="store_true", help="Run without CAN (standalone echo)")
     parser.add_argument("--rate", type=int, default=100, help="Bridge tick rate in Hz")
+    parser.add_argument("--vcan-start", type=int, default=1, help="Starting vcan index (default 1, vcan0 reserved for SIL)")
     args = parser.parse_args()
 
     num_cars = max(1, min(3, args.cars))
@@ -469,7 +421,7 @@ def main():
         sensor_port = 5001 + i * 2    # Godot sends sensor data here
         actuator_port = 5002 + i * 2  # Bridge sends actuator commands here
         spi_port = 9100 + i           # CVC SPI pedal UDP port
-        can_iface = f"vcan{i}"
+        can_iface = f"vcan{i + args.vcan_start}"
 
         if use_can:
             bridge = CarBridge(i, can_iface, sensor_port, actuator_port, spi_port, use_can=True)
