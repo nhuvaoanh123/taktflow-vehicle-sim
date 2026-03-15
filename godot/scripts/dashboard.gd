@@ -97,7 +97,7 @@ func _build() -> void:
 
 	# ── Controls hint ──
 	var hint_label := Label.new()
-	hint_label.text = "WASD=drive  S=reverse  C=cam  Tab=car  V=vECU  Space=stop  R=reset"
+	hint_label.text = "WASD=drive  C=cam  Tab=car  V=vECU  Space=stop  R=reset  F=faults"
 	hint_label.add_theme_font_size_override("font_size", 10)
 	hint_label.add_theme_color_override("font_color", Color(0.35, 0.38, 0.45, 0.5))
 	hint_label.position = Vector2(200, 8)

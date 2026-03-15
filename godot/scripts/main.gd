@@ -3,6 +3,7 @@ extends Node3D
 const VehicleController = preload("res://scripts/vehicle_controller.gd")
 const CameraFollow = preload("res://scripts/camera_follow.gd")
 const Dashboard = preload("res://scripts/dashboard.gd")
+const FaultPanel = preload("res://scripts/fault_panel.gd")
 
 var cars: Array[VehicleBody3D] = []
 var active_car_index := 0
@@ -20,6 +21,7 @@ func _ready() -> void:
 	_create_ai_cars(5)
 	_create_camera()
 	_create_dashboard()
+	_create_fault_panel()
 
 # ── Environment ──────────────────────────────────────────────
 
@@ -420,6 +422,16 @@ func _create_dashboard() -> void:
 	dashboard_control.set_script(Dashboard)
 	dashboard_control.set_anchors_preset(Control.PRESET_FULL_RECT)
 	canvas.add_child(dashboard_control)
+
+# ── Fault Panel ──────────────────────────────────────────────
+
+func _create_fault_panel() -> void:
+	var canvas := get_node("HUD")
+	var fault_ctrl := Control.new()
+	fault_ctrl.name = "FaultPanel"
+	fault_ctrl.set_script(FaultPanel)
+	fault_ctrl.set_anchors_preset(Control.PRESET_FULL_RECT)
+	canvas.add_child(fault_ctrl)
 
 # ── Input ────────────────────────────────────────────────────
 
