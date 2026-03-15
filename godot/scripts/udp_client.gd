@@ -8,7 +8,7 @@ signal actuator_data_received(data: Dictionary)
 # Port mapping: Car 0 = 5001/5002, Car 1 = 5003/5004, Car 2 = 5005/5006
 const BASE_SEND_PORT := 5001
 const BASE_RECV_PORT := 5002
-const BRIDGE_HOST := "127.0.0.1"
+const BRIDGE_HOST := "192.168.0.195"  # Raspberry Pi on LAN
 const MAX_CARS := 3
 
 var _recv_sockets: Array[PacketPeerUDP] = []
