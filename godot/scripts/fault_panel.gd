@@ -235,7 +235,7 @@ func _update_state_monitor() -> void:
 	if cars.is_empty():
 		return
 
-	var car := cars[0]
+	var car: VehicleBody3D = cars[0]
 	var new_state: String = car.get("vecu_vehicle_state")
 
 	if new_state != _last_state and _last_state != "":

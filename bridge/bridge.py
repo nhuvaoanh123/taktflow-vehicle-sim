@@ -111,7 +111,8 @@ class CarBridge:
 
     def __init__(self, car_index: int, can_interface: str,
                  godot_sensor_port: int, godot_actuator_port: int,
-                 spi_pedal_port: int, use_can: bool = True):
+                 spi_pedal_port: int, use_can: bool = True,
+                 godot_host: str = "192.168.0.158"):
         self.car_index = car_index
         self.can_interface = can_interface
         self.use_can = use_can and HAS_CAN
@@ -123,7 +124,7 @@ class CarBridge:
 
         # UDP: send actuator commands TO Godot
         self.actuator_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.godot_actuator_addr = ("127.0.0.1", godot_actuator_port)
+        self.godot_actuator_addr = (godot_host, godot_actuator_port)
 
         # UDP: send pedal override to CVC SPI
         self.spi_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -357,13 +358,14 @@ class StandaloneEcho:
     """When no CAN is available, echo sensor data back as fake actuator commands.
     This lets Godot run standalone with keyboard controls + dashboard working."""
 
-    def __init__(self, car_index: int, sensor_port: int, actuator_port: int):
+    def __init__(self, car_index: int, sensor_port: int, actuator_port: int,
+                 godot_host: str = "192.168.0.158"):
         self.car_index = car_index
         self.sensor_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sensor_sock.bind(("0.0.0.0", sensor_port))
         self.sensor_sock.setblocking(False)
         self.actuator_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.actuator_addr = ("127.0.0.1", actuator_port)
+        self.actuator_addr = (godot_host, actuator_port)
         self.start_time = time.time()
 
     def tick(self) -> None:
@@ -408,6 +410,7 @@ def main():
     parser.add_argument("--no-can", action="store_true", help="Run without CAN (standalone echo)")
     parser.add_argument("--rate", type=int, default=100, help="Bridge tick rate in Hz")
     parser.add_argument("--vcan-start", type=int, default=1, help="Starting vcan index (default 1, vcan0 reserved for SIL)")
+    parser.add_argument("--godot-host", type=str, default="192.168.0.158", help="Godot laptop IP address")
     args = parser.parse_args()
 
     num_cars = max(1, min(3, args.cars))
@@ -424,9 +427,10 @@ def main():
         can_iface = f"vcan{i + args.vcan_start}"
 
         if use_can:
-            bridge = CarBridge(i, can_iface, sensor_port, actuator_port, spi_port, use_can=True)
+            bridge = CarBridge(i, can_iface, sensor_port, actuator_port, spi_port,
+                               use_can=True, godot_host=args.godot_host)
         else:
-            bridge = StandaloneEcho(i, sensor_port, actuator_port)
+            bridge = StandaloneEcho(i, sensor_port, actuator_port, godot_host=args.godot_host)
 
         bridges.append(bridge)
         print(f"[bridge] Car {i}: sensor←:{sensor_port} actuator→:{actuator_port}"
